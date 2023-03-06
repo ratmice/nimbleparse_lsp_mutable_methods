@@ -1,8 +1,9 @@
 use cfgrammar::yacc;
 use lrpar::RTParserBuilder;
 use ouroboros::self_referencing;
+use std::borrow::Cow;
 use tower_lsp::jsonrpc;
-use tower_lsp::lsp_types::*;
+use tower_lsp::lsp_types as lsp_ty;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 #[derive(thiserror::Error, Debug)]
@@ -88,7 +89,7 @@ impl Backend {
         } else {
             Err(jsonrpc::Error {
                 code: jsonrpc::ErrorCode::InvalidParams,
-                message: std::borrow::Cow::from("Unknown command name"),
+                message: Cow::from("Unknown command name"),
                 data: Some(serde_json::Value::String(params.cmd)),
             })
         }
@@ -187,17 +188,82 @@ impl State {
     }
 }
 
+fn initialize_failed(reason: String) -> jsonrpc::Result<lsp_ty::InitializeResult> {
+    Err(tower_lsp::jsonrpc::Error {
+        code: tower_lsp::jsonrpc::ErrorCode::ServerError(-32002),
+        message: Cow::from(format!("Error during server initialization: {reason}")),
+        data: None,
+    })
+}
+
 #[tower_lsp::async_trait(?Send)]
 impl LanguageServer for Backend {
-    async fn initialize(&mut self, _: InitializeParams) -> jsonrpc::Result<InitializeResult> {
-        Ok(InitializeResult::default())
+    async fn initialize(
+        &mut self,
+        params: lsp_ty::InitializeParams,
+    ) -> jsonrpc::Result<lsp_ty::InitializeResult> {
+        self.client
+            .log_message(lsp_ty::MessageType::LOG, "initializing...")
+            .await;
+
+        let caps = params.capabilities;
+        if params.workspace_folders.is_none() || caps.workspace.is_none() {
+            initialize_failed("requires workspace & capabilities".to_string())?;
+        }
+
+        if !caps
+            .text_document
+            .map_or(false, |doc| doc.publish_diagnostics.is_some())
+        {
+            initialize_failed("requires diagnostics capabilities".to_string())?;
+        }
+
+        let mut state = self.state.lock().await;
+
+        // vscode only supports dynamic_registration
+        // neovim supports neither dynamic or static registration of this yet.
+        state.with_client_monitor_mut(|client_monitor| {
+            *client_monitor = caps.workspace.map_or(false, |wrk| {
+                wrk.did_change_watched_files.map_or(false, |dynamic| {
+                    dynamic.dynamic_registration.unwrap_or(false)
+                })
+            })
+        });
+
+        state.with_toml_mut(|toml| {
+            let paths = params.workspace_folders.unwrap();
+            let paths = paths
+                .iter()
+                .map(|folder| folder.uri.to_file_path().unwrap());
+            toml.extend(paths.map(|workspace_path| {
+                let toml_path = workspace_path.join("nimbleparse.toml");
+                // We should probably fix this, to not be sync when we implement reloading the toml file on change...
+                let toml_file = std::fs::read_to_string(toml_path).unwrap();
+                let workspace: nimbleparse_toml::Workspace =
+                    toml::de::from_str(toml_file.as_str()).unwrap();
+                (workspace_path, WorkspaceCfg { workspace })
+            }));
+        });
+
+        Ok(lsp_ty::InitializeResult {
+            capabilities: lsp_ty::ServerCapabilities {
+                text_document_sync: Some(lsp_ty::TextDocumentSyncCapability::Kind(
+                    lsp_ty::TextDocumentSyncKind::INCREMENTAL,
+                )),
+                hover_provider: Some(lsp_ty::HoverProviderCapability::Simple(true)),
+                completion_provider: Some(lsp_ty::CompletionOptions::default()),
+                // Can't return this *and* register in the editor client because of vscode.
+                // returning this doesn't seem to handle arguments, or work with commands
+                // that can be activationEvents.  So this is intentionally None,
+                // even though we provide commands.
+                execute_command_provider: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
     }
 
-    async fn initialized(&mut self, _: InitializedParams) {
-        self.client
-            .log_message(MessageType::INFO, "server initialized!")
-            .await;
-    }
+    async fn initialized(&mut self, params: lsp_ty::InitializedParams) {}
 
     async fn shutdown(&mut self) -> jsonrpc::Result<()> {
         Ok(())
