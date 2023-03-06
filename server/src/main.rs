@@ -7,7 +7,7 @@ struct Backend {
     client: Client,
 }
 
-#[tower_lsp::async_trait]
+#[tower_lsp::async_trait(?Send)]
 impl LanguageServer for Backend {
     async fn initialize(&mut self, _: InitializeParams) -> Result<InitializeResult> {
         Ok(InitializeResult::default())
