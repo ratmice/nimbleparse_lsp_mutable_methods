@@ -1,0 +1,20 @@
+[package]
+name = "nimbleparse_lsp_tower_trait"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+cfgrammar = "0.13.1"
+lrlex = "0.13.1"
+lrpar = "0.13.1"
+lrtable = "0.13.1"
+ouroboros = "0.15.6"
+thiserror = "1.0.39"
+tower-lsp = { git="https://github.com/ebkalderon/tower-lsp.git", branch="support-mutable-methods" }
+toml = { version = "0.7.2", features = ["preserve_order"] }
+serde_json = { version = "1.0.94", features = ["preserve_order"] }
+nimbleparse_toml = {path = "../toml"}
+ropey = "1.6.0"
+tokio = { version = "1.26.0", features = ["fs", "macros", "rt-multi-thread", "io-std", "net", "process"] }

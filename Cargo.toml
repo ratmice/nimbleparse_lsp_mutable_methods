@@ -1,0 +1,10 @@
+[workspace]
+members = [
+  "server",
+  "toml",
+  "xtask",
+]
+
+[profile.release]
+codegen-units=1
+lto=true
