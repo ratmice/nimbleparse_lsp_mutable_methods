@@ -1,4 +1,6 @@
 use cfgrammar::yacc;
+use lrpar::RTParserBuilder;
+use ouroboros::self_referencing;
 use tower_lsp::jsonrpc;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
@@ -25,8 +27,6 @@ pub enum StateGraphPretty {
     AllEdges,
 }
 
-
-#[derive(Debug)]
 struct Backend {
     client: Client,
     state: tokio::sync::Mutex<State>,
@@ -35,8 +35,6 @@ struct Backend {
 #[derive(Debug, Clone)]
 pub struct WorkspaceCfg {
     workspace: nimbleparse_toml::Workspace,
-    //toml_path: std::path::PathBuf,
-    //toml_file: rope::Rope,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -123,10 +121,26 @@ impl ParserInfo {
     }
 }
 
-#[derive(Debug)]
-struct State {
+use lrlex::LexerDef as _;
+type LexerDef = lrlex::LRNonStreamingLexerDef<lrlex::DefaultLexerTypes>;
+
+pub struct ParserData(
+    Option<(
+        LexerDef,
+        yacc::YaccGrammar,
+        lrtable::StateGraph<u32>,
+        lrtable::StateTable<u32>,
+    )>,
+);
+
+#[self_referencing(pub_extras)]
+pub struct State {
     client_monitor: bool,
     extensions: std::collections::HashMap<std::ffi::OsString, ParserInfo>,
+    parser_data: Vec<ParserData>,
+    #[borrows(parser_data)]
+    #[covariant]
+    parser_builders: Vec<Option<RTParserBuilder<'this, u32, lrlex::DefaultLexerTypes<u32>>>>,
     toml: Workspaces,
     warned_needs_restart: bool,
 }
@@ -134,7 +148,7 @@ struct State {
 impl State {
     fn affected_parsers(&self, path: &std::path::Path, ids: &mut Vec<usize>) {
         if let Some(extension) = path.extension() {
-            let id = self.extensions.get(extension).map(ParserInfo::id);
+            let id = self.borrow_extensions().get(extension).map(ParserInfo::id);
             // A couple of corner cases here:
             //
             // * The kind of case where you have foo.l and bar.y/baz.y using the same lexer.
@@ -149,7 +163,7 @@ impl State {
             }
 
             ids.extend(
-                self.extensions
+                self.borrow_extensions()
                     .values()
                     .filter(|parser_info| path == parser_info.l_path || path == parser_info.y_path)
                     .map(ParserInfo::id),
@@ -162,13 +176,14 @@ impl State {
 
     /// Expects to be given a path to a parser, returns the parser info for that parser.
     fn find_parser_info(&self, parser_path: &std::path::Path) -> Option<&ParserInfo> {
-        self.extensions
+        self.borrow_extensions()
             .values()
             .find(|parser_info| parser_info.y_path == parser_path)
     }
 
     fn parser_for(&self, path: &std::path::Path) -> Option<&ParserInfo> {
-        path.extension().and_then(|ext| self.extensions.get(ext))
+        path.extension()
+            .and_then(|ext| self.borrow_extensions().get(ext))
     }
 }
 
@@ -197,12 +212,17 @@ fn run_server_arg() -> std::result::Result<(), ServerError> {
         log::set_max_level(log::LevelFilter::Info);
         let (stdin, stdout) = (tokio::io::stdin(), tokio::io::stdout());
         let (service, socket) = tower_lsp::LspService::build(|client| Backend {
-            state: tokio::sync::Mutex::new(State {
-                toml: std::collections::HashMap::new(),
-                warned_needs_restart: false,
-                client_monitor: false,
-                extensions: std::collections::HashMap::new(),
-            }),
+            state: tokio::sync::Mutex::new(
+                StateBuilder {
+                    toml: std::collections::HashMap::new(),
+                    warned_needs_restart: false,
+                    client_monitor: false,
+                    extensions: std::collections::HashMap::new(),
+                    parser_data: Vec::new(),
+                    parser_builders_builder: |_| Vec::new(),
+                }
+                .build(),
+            ),
             client,
         })
         .custom_method(
