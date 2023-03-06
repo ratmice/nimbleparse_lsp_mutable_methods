@@ -6,6 +6,8 @@ use tower_lsp::jsonrpc;
 use tower_lsp::lsp_types as lsp_ty;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
+use std::ops::DerefMut as _;
+
 #[derive(thiserror::Error, Debug)]
 enum ServerError {
     #[error("argument requires a path")]
@@ -135,21 +137,25 @@ pub struct ParserData(
 );
 
 #[self_referencing(pub_extras)]
-pub struct State {
+pub struct ParsingState {
+    data: Vec<ParserData>,
+    #[borrows(data)]
+    #[covariant]
+    rt_parser_builders: Vec<Option<RTParserBuilder<'this, u32, lrlex::DefaultLexerTypes<u32>>>>,
+}
+
+struct State {
     client_monitor: bool,
     extensions: std::collections::HashMap<std::ffi::OsString, ParserInfo>,
-    parser_data: Vec<ParserData>,
-    #[borrows(parser_data)]
-    #[covariant]
-    parser_builders: Vec<Option<RTParserBuilder<'this, u32, lrlex::DefaultLexerTypes<u32>>>>,
     toml: Workspaces,
     warned_needs_restart: bool,
+    parsing_state: ParsingState,
 }
 
 impl State {
     fn affected_parsers(&self, path: &std::path::Path, ids: &mut Vec<usize>) {
         if let Some(extension) = path.extension() {
-            let id = self.borrow_extensions().get(extension).map(ParserInfo::id);
+            let id = self.extensions.get(extension).map(ParserInfo::id);
             // A couple of corner cases here:
             //
             // * The kind of case where you have foo.l and bar.y/baz.y using the same lexer.
@@ -164,7 +170,7 @@ impl State {
             }
 
             ids.extend(
-                self.borrow_extensions()
+                self.extensions
                     .values()
                     .filter(|parser_info| path == parser_info.l_path || path == parser_info.y_path)
                     .map(ParserInfo::id),
@@ -177,14 +183,13 @@ impl State {
 
     /// Expects to be given a path to a parser, returns the parser info for that parser.
     fn find_parser_info(&self, parser_path: &std::path::Path) -> Option<&ParserInfo> {
-        self.borrow_extensions()
+        self.extensions
             .values()
             .find(|parser_info| parser_info.y_path == parser_path)
     }
 
     fn parser_for(&self, path: &std::path::Path) -> Option<&ParserInfo> {
-        path.extension()
-            .and_then(|ext| self.borrow_extensions().get(ext))
+        path.extension().and_then(|ext| self.extensions.get(ext))
     }
 }
 
@@ -222,28 +227,24 @@ impl LanguageServer for Backend {
 
         // vscode only supports dynamic_registration
         // neovim supports neither dynamic or static registration of this yet.
-        state.with_client_monitor_mut(|client_monitor| {
-            *client_monitor = caps.workspace.map_or(false, |wrk| {
-                wrk.did_change_watched_files.map_or(false, |dynamic| {
-                    dynamic.dynamic_registration.unwrap_or(false)
-                })
+        state.client_monitor = caps.workspace.map_or(false, |wrk| {
+            wrk.did_change_watched_files.map_or(false, |dynamic| {
+                dynamic.dynamic_registration.unwrap_or(false)
             })
         });
 
-        state.with_toml_mut(|toml| {
-            let paths = params.workspace_folders.unwrap();
-            let paths = paths
-                .iter()
-                .map(|folder| folder.uri.to_file_path().unwrap());
-            toml.extend(paths.map(|workspace_path| {
-                let toml_path = workspace_path.join("nimbleparse.toml");
-                // We should probably fix this, to not be sync when we implement reloading the toml file on change...
-                let toml_file = std::fs::read_to_string(toml_path).unwrap();
-                let workspace: nimbleparse_toml::Workspace =
-                    toml::de::from_str(toml_file.as_str()).unwrap();
-                (workspace_path, WorkspaceCfg { workspace })
-            }));
-        });
+        let paths = params.workspace_folders.unwrap();
+        let paths = paths
+            .iter()
+            .map(|folder| folder.uri.to_file_path().unwrap());
+        state.toml.extend(paths.map(|workspace_path| {
+            let toml_path = workspace_path.join("nimbleparse.toml");
+            // We should probably fix this, to not be sync when we implement reloading the toml file on change...
+            let toml_file = std::fs::read_to_string(toml_path).unwrap();
+            let workspace: nimbleparse_toml::Workspace =
+                toml::de::from_str(toml_file.as_str()).unwrap();
+            (workspace_path, WorkspaceCfg { workspace })
+        }));
 
         Ok(lsp_ty::InitializeResult {
             capabilities: lsp_ty::ServerCapabilities {
@@ -263,7 +264,94 @@ impl LanguageServer for Backend {
         })
     }
 
-    async fn initialized(&mut self, params: lsp_ty::InitializedParams) {}
+    async fn initialized(&mut self, params: lsp_ty::InitializedParams) {
+        let mut state = self.state.lock().await;
+        let state = state.deref_mut();
+        let mut globs: Vec<lsp_ty::Registration> = Vec::new();
+        if state.client_monitor {
+            for WorkspaceCfg { workspace, .. } in state.toml.values() {
+                for parser in workspace.parsers.get_ref() {
+                    let glob = format!("**/*{}", parser.extension.get_ref());
+                    let mut reg = serde_json::Map::new();
+                    reg.insert(
+                        "globPattern".to_string(),
+                        serde_json::value::Value::String(glob),
+                    );
+                    let mut watchers = serde_json::Map::new();
+                    let blah = vec![serde_json::value::Value::Object(reg)];
+                    watchers.insert(
+                        "watchers".to_string(),
+                        serde_json::value::Value::Array(blah),
+                    );
+
+                    globs.push(lsp_ty::Registration {
+                        id: "1".to_string(),
+                        method: "workspace/didChangeWatchedFiles".to_string(),
+                        register_options: Some(serde_json::value::Value::Object(watchers)),
+                    });
+                }
+            }
+            self.client
+                .log_message(
+                    lsp_ty::MessageType::LOG,
+                    format!("registering! {:?}", globs.clone()),
+                )
+                .await;
+        }
+
+        /* The lsp_types and lsp specification documentation say to register this dynamically
+         * rather than statically, I'm not sure of a good place we can register it besides here.
+         * Unfortunately register_capability returns a result, and this notification cannot return one;
+         * given that this has to manually match errors and can't use much in the way of ergonomics.
+         */
+        if state.client_monitor {
+            if let Err(e) = self.client.register_capability(globs).await {
+                self.client
+                    .log_message(
+                        lsp_ty::MessageType::ERROR,
+                        format!(
+                            "registering for {}: {}",
+                            "workspace/didChangeWatchedFiles", e
+                        ),
+                    )
+                    .await;
+                panic!("{}", e);
+            }
+        }
+        // construct extension lookup table
+        {
+            let extensions = &mut state.extensions;
+            for (workspace_path, workspace_cfg) in (state.toml).iter() {
+                let workspace = &workspace_cfg.workspace;
+                for (id, parser) in workspace.parsers.get_ref().iter().enumerate() {
+                    let l_path = workspace_path.join(parser.l_file.get_ref());
+                    let y_path = workspace_path.join(parser.y_file.get_ref());
+                    let extension = parser.extension.clone().into_inner();
+                    // Want this to match the output of Path::extension() so trim any leading '.'.
+                    let extension_str = extension
+                        .strip_prefix('.')
+                        .map(|x| x.to_string())
+                        .unwrap_or(extension);
+                    let extension = std::ffi::OsStr::new(&extension_str);
+                    let parser_info = ParserInfo {
+                        id,
+                        l_path: workspace_path.join(l_path),
+                        y_path: workspace_path.join(y_path),
+                        recovery_kind: parser.recovery_kind,
+                        yacc_kind: parser.yacc_kind,
+                        extension: extension.to_owned(),
+                        quiet: parser.quiet,
+                    };
+
+                    extensions.insert(extension.to_os_string(), parser_info.clone());
+                }
+            }
+        }
+
+        self.client
+            .log_message(lsp_ty::MessageType::LOG, "initialized!")
+            .await;
+    }
 
     async fn shutdown(&mut self) -> jsonrpc::Result<()> {
         Ok(())
@@ -278,17 +366,17 @@ fn run_server_arg() -> std::result::Result<(), ServerError> {
         log::set_max_level(log::LevelFilter::Info);
         let (stdin, stdout) = (tokio::io::stdin(), tokio::io::stdout());
         let (service, socket) = tower_lsp::LspService::build(|client| Backend {
-            state: tokio::sync::Mutex::new(
-                StateBuilder {
-                    toml: std::collections::HashMap::new(),
-                    warned_needs_restart: false,
-                    client_monitor: false,
-                    extensions: std::collections::HashMap::new(),
-                    parser_data: Vec::new(),
-                    parser_builders_builder: |_| Vec::new(),
+            state: tokio::sync::Mutex::new(State {
+                toml: std::collections::HashMap::new(),
+                warned_needs_restart: false,
+                client_monitor: false,
+                extensions: std::collections::HashMap::new(),
+                parsing_state: ParsingStateBuilder {
+                    data: Vec::new(),
+                    rt_parser_builders_builder: |_| Vec::new(),
                 }
                 .build(),
-            ),
+            }),
             client,
         })
         .custom_method(
