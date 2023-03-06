@@ -138,10 +138,10 @@ pub struct ParserData(
 
 #[self_referencing(pub_extras)]
 pub struct ParsingState {
-    data: Vec<ParserData>,
+    data: ParserData,
     #[borrows(data)]
     #[covariant]
-    rt_parser_builders: Vec<Option<RTParserBuilder<'this, u32, lrlex::DefaultLexerTypes<u32>>>>,
+    rt_parser_builders: Option<RTParserBuilder<'this, u32, lrlex::DefaultLexerTypes<u32>>>,
 }
 
 struct State {
@@ -149,7 +149,7 @@ struct State {
     extensions: std::collections::HashMap<std::ffi::OsString, ParserInfo>,
     toml: Workspaces,
     warned_needs_restart: bool,
-    parsing_state: ParsingState,
+    parsing_state: Vec<ParsingState>,
 }
 
 impl State {
@@ -371,11 +371,7 @@ fn run_server_arg() -> std::result::Result<(), ServerError> {
                 warned_needs_restart: false,
                 client_monitor: false,
                 extensions: std::collections::HashMap::new(),
-                parsing_state: ParsingStateBuilder {
-                    data: Vec::new(),
-                    rt_parser_builders_builder: |_| Vec::new(),
-                }
-                .build(),
+                parsing_state: Vec::new(),
             }),
             client,
         })
